@@ -130,7 +130,7 @@ impl Drop for Stream {
 
 /// Watch `/` from `since` (an event id). Batches of directory-level events,
 /// stamped with `stream`, arrive on `tx` until the returned stream is dropped.
-pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> Stream {
+pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> std::io::Result<Stream> {
     let a = api();
     unsafe {
         let root = (a.string)(std::ptr::null(), c"/".as_ptr(), 0x0800_0100);
@@ -147,14 +147,19 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>, stream: u32) -> S
         // Not IgnoreSelf: linked into an app, the app's own renames and moves
         // are exactly what its search must see.
         let s = (a.create)(std::ptr::null(), on_events, &ctx, arr, since, latency, CREATE_FLAG_NO_DEFER);
-        // The callback only copies paths out, but it must not queue behind
-        // busy threads (a first build runs on every core at user-initiated
-        // QoS): fseventsd drops what a client falls behind on, and the drop
-        // costs a relist of every folder changed since the last sync.
+        if s.is_null() {
+            return Err(std::io::Error::other("could not create FSEvents stream"));
+        }
+        // Keep delivery off busy indexing threads so fseventsd does not drop it.
         let qos = libc::qos_class_t::QOS_CLASS_USER_INITIATED as u32;
         let q = dispatch_queue_create(c"fsearch.fsevents".as_ptr(), dispatch_queue_attr_make_with_qos_class(std::ptr::null(), qos, 0));
         (a.set_queue)(s, q);
-        (a.start)(s);
-        Stream(s)
+        if (a.start)(s) == 0 {
+            (a.invalidate)(s);
+            (a.release)(s);
+            return Err(std::io::Error::other("could not start FSEvents stream"));
+        }
+        Ok(Stream(s))
     }
 }
+

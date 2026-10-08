@@ -4,6 +4,7 @@ use crate::index::{BM_DOUBLE, BM_FIRST, BM_SECOND, BM_START, CLASSES, Index, ZON
 use crate::live::Live;
 use crate::walk::{FLAG_HIDDEN, KIND_DIR, KIND_FILE, KIND_LINK};
 use rayon::prelude::*;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -240,6 +241,18 @@ fn takes_typos(text: &[u8], mode: Mode) -> bool {
     mode == Mode::Fuzzy && text.len() >= TYPO_MIN_LEN
 }
 
+/// Global result ordering, applied before `limit` across base and overlay.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Sort {
+    #[default]
+    Relevance,
+    Name,
+    ModifiedDesc,
+    ModifiedAsc,
+    SizeDesc,
+    Type,
+}
+
 #[derive(Clone, Default)]
 pub struct Query {
     pub tokens: Vec<Token>,
@@ -254,6 +267,7 @@ pub struct Query {
     pub name_re: Option<regex::bytes::Regex>,
     pub path_re: Option<regex::bytes::Regex>,
     pub limit: usize,
+    pub sort: Sort,
     /// Content search: handled by the content layer, carried here so one
     /// query string can say everything.
     pub grep: Option<String>,
@@ -289,7 +303,9 @@ const TYPES: &[(&str, &[&str])] = &[
 impl Query {
     /// Parse the human query language. Plain words are fuzzy tokens;
     /// `'x` exact, `^x` prefix, `x$` suffix, `!x` negate; filters are
-    /// `ext: type: kind: in: size: mtime: re: path: limit: grep: regex: sym:`.
+    /// `ext: type: kind: in: size: mtime: re: path: limit: sort: grep: regex: sym:`.
+    /// `sort:` accepts relevance (default), name, modified-desc,
+    /// modified-asc, size-desc, or type (directories, then extension groups).
     pub fn parse(s: &str, home: &str) -> Result<Query, String> {
         let mut q = Query { size: (0, u64::MAX), mtime: (0, u32::MAX), limit: 50, ..Default::default() };
         for word in split_words(s) {
@@ -368,6 +384,15 @@ impl Query {
             "re" => self.name_re = Some(regex::bytes::Regex::new(&format!("(?i){v}")).map_err(|e| e.to_string())?),
             "path" => self.path_re = Some(regex::bytes::Regex::new(&format!("(?i){v}")).map_err(|e| e.to_string())?),
             "limit" => self.limit = v.parse().map_err(|_| "bad limit")?,
+            "sort" => self.sort = match v {
+                "relevance" => Sort::Relevance,
+                "name" => Sort::Name,
+                "modified-desc" => Sort::ModifiedDesc,
+                "modified-asc" => Sort::ModifiedAsc,
+                "size-desc" => Sort::SizeDesc,
+                "type" => Sort::Type,
+                _ => return Err(format!("unknown sort {v}")),
+            },
             "grep" | "content" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Literal),
             "regex" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Regex),
             "sym" | "symbol" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Symbol),
@@ -480,8 +505,8 @@ pub struct DirMatch {
 /// one folder come in a row (typing): the last answer holds for a second,
 /// less than the index takes to see most changes anyway.
 fn real_path(p: String) -> String {
-    static LAST: std::sync::Mutex<Option<(String, String, std::time::Instant)>> = std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
+    static LAST: parking_lot::Mutex<Option<(String, String, std::time::Instant)>> = parking_lot::Mutex::new(None);
+    let mut last = LAST.lock();
     if let Some((from, to, at)) = &*last
         && *from == p
         && at.elapsed() < std::time::Duration::from_secs(1)
@@ -918,15 +943,14 @@ fn token_matches(name: &[u8], t: &Token) -> bool {
     }
 }
 
-/// Top k by (score, then lower entry index): a total order, so the result
-/// does not depend on which thread saw which entry first. Candidates above
-/// the floor collect in a buffer that is cut back to k now and then, which
-/// is cheaper than a heap when most of the disk matches.
-struct TopK {
+/// Bounded top-k buffer: only survivors are retained, even for broad sorts.
+/// `cmp` orders best first; relevance uses packed score/index keys directly.
+struct TopK<'a, C> {
     k: usize,
     buf: Vec<u64>,
-    /// Keys at or below this cannot get in.
+    /// Zero until k survivors establish a floor.
     floor: u64,
+    cmp: &'a C,
 }
 
 #[inline(always)]
@@ -934,15 +958,15 @@ fn key(score: i32, i: u32) -> u64 {
     (((score as i64 - i32::MIN as i64) as u64) << 32) | (!i) as u64
 }
 
-impl TopK {
-    fn new(k: usize, floor: u64) -> TopK {
-        TopK { k, buf: Vec::new(), floor: if k == 0 { u64::MAX } else { floor } }
+impl<'a, C: Fn(u64, u64) -> Ordering> TopK<'a, C> {
+    fn new(k: usize, floor: u64, cmp: &'a C) -> Self {
+        Self { k, buf: Vec::new(), floor, cmp }
     }
     #[inline]
     fn push(&mut self, key: u64) {
-        if key > self.floor {
+        if self.floor == 0 || (self.cmp)(key, self.floor).is_lt() {
             self.buf.push(key);
-            if self.buf.len() >= (2 * self.k).max(64) {
+            if self.buf.len() >= self.k.saturating_mul(2).max(64) {
                 self.cut();
             }
         }
@@ -950,7 +974,7 @@ impl TopK {
     /// Keep the k best; the k-th becomes the floor.
     fn cut(&mut self) {
         if self.buf.len() > self.k {
-            self.buf.select_nth_unstable_by(self.k - 1, |a, b| b.cmp(a));
+            self.buf.select_nth_unstable_by(self.k - 1, |a, b| (self.cmp)(*a, *b));
             self.buf.truncate(self.k);
             self.floor = self.buf[self.k - 1];
         }
@@ -1027,33 +1051,34 @@ impl<T> Cells<T> {
     }
 }
 
-/// Top `k` over `0..n` items with keys above `floor`: a few contiguous
+/// Top `k` over `0..n` items better than `floor`: a few contiguous
 /// pieces per thread, each with its own heap, then one selection over their
 /// survivors (merging heaps pairwise costs more than the scan when `k` is
 /// large). Up to INLINE_VISITS entries to `visit` in all take less time
 /// than waking threads.
-fn top_k(n: usize, k: usize, visits: usize, floor: u64, visit: impl Fn(std::ops::Range<usize>, &mut TopK) + Sync) -> Vec<Hit> {
+fn top_k<C>(n: usize, k: usize, visits: usize, floor: u64, cmp: C, visit: impl Fn(std::ops::Range<usize>, &mut TopK<'_, C>) + Sync) -> Vec<Hit>
+where C: Fn(u64, u64) -> Ordering + Sync {
+    if k == 0 {
+        return Vec::new();
+    }
     let piece = |r: std::ops::Range<usize>| {
-        let mut top = TopK::new(k, floor);
+        let mut top = TopK::new(k, floor, &cmp);
         visit(r, &mut top);
         top.cut();
         top
     };
-    let tops: Vec<TopK> = if visits <= INLINE_VISITS {
+    let tops: Vec<TopK<'_, C>> = if visits <= INLINE_VISITS {
         vec![piece(0..n)]
     } else {
         let pieces = (rayon::current_num_threads() * 4).min(n.max(1));
         let step = n.div_ceil(pieces).max(1);
         par_each(pieces, || (), |_, p| piece((p * step).min(n)..((p + 1) * step).min(n)))
     };
-    // A full piece's k-th best already bounds the overall k-th from below.
-    let floor = tops.iter().filter(|t| t.buf.len() == k).map(|t| t.floor).max().unwrap_or(0);
-    let mut keys: Vec<u64> = tops.into_iter().flat_map(|t| t.buf).filter(|&x| x >= floor).collect();
+    // A piece with a floor already bounds the overall k-th from below.
+    let floor = tops.iter().filter(|t| t.floor != 0 && t.buf.len() == k).map(|t| t.floor).min_by(|a, b| cmp(*a, *b));
+    let mut keys: Vec<u64> = tops.into_iter().flat_map(|t| t.buf).filter(|&x| floor.is_none_or(|f| !cmp(x, f).is_gt())).collect();
     if keys.len() > k {
-        if k == 0 {
-            return Vec::new();
-        }
-        keys.select_nth_unstable_by(k - 1, |a, b| b.cmp(a));
+        keys.select_nth_unstable_by(k - 1, |a, b| cmp(*a, *b));
         keys.truncate(k);
     }
     keys.into_iter().map(|x| Hit { score: ((x >> 32) as i64 + i32::MIN as i64) as i32, idx: !(x as u32), over: None }).collect()
@@ -1063,6 +1088,91 @@ fn ext_ok(name: &[u8], exts: &[Vec<u8>]) -> bool {
     let Some(dot) = name.iter().rposition(|&b| b == b'.') else { return false };
     let e = &name[dot + 1..];
     exts.iter().any(|x| x.len() == e.len() && x.iter().zip(e).all(|(&a, &b)| a == fold(b)))
+}
+
+/// Borrow metadata while selecting candidates; paths are built only for
+/// equal-name ties, never for date/size sorting.
+#[derive(Clone, Copy)]
+enum Entry<'a> {
+    Base(&'a crate::index::Index, usize),
+    Overlay(&'a [u8], &'a crate::live::OEnt),
+}
+
+impl<'a> Entry<'a> {
+    fn name(self) -> &'a [u8] {
+        match self {
+            Self::Base(idx, i) => idx.name(i),
+            Self::Overlay(path, _) => &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..],
+        }
+    }
+    fn kind(self) -> u8 {
+        match self {
+            Self::Base(idx, i) => idx.kind()[i] & 3,
+            Self::Overlay(_, o) => o.kind & 3,
+        }
+    }
+    fn size(self) -> u64 {
+        match self {
+            Self::Base(idx, i) => idx.size_of(i),
+            Self::Overlay(_, o) => o.size,
+        }
+    }
+    fn mtime(self) -> u32 {
+        match self {
+            Self::Base(idx, i) => idx.mtime()[i],
+            Self::Overlay(_, o) => o.mtime,
+        }
+    }
+    fn identity_cmp(self, other: Self) -> Ordering {
+        match (self, other) {
+            (Self::Base(_, a), Self::Base(_, b)) => a.cmp(&b),
+            (Self::Base(..), Self::Overlay(..)) => Ordering::Less,
+            (Self::Overlay(..), Self::Base(..)) => Ordering::Greater,
+            (Self::Overlay(a, _), Self::Overlay(b, _)) => a.cmp(b),
+        }
+    }
+    fn path<'b>(self, buf: &'b mut Vec<u8>) -> &'b [u8] where 'a: 'b {
+        match self {
+            Self::Base(idx, i) => { idx.path(i, buf); buf }
+            Self::Overlay(path, _) => path,
+        }
+    }
+}
+
+fn cmp_ci(a: &[u8], b: &[u8]) -> Ordering {
+    a.iter().map(|&b| fold(b)).cmp(b.iter().map(|&b| fold(b)))
+}
+
+fn extension(name: &[u8]) -> &[u8] {
+    name.iter().rposition(|&b| b == b'.').map_or(&name[name.len()..], |p| &name[p + 1..])
+}
+
+impl Sort {
+    fn compare(self, a: Entry<'_>, b: Entry<'_>) -> Ordering {
+        let primary = match self {
+            Self::ModifiedDesc => b.mtime().cmp(&a.mtime()),
+            Self::ModifiedAsc => a.mtime().cmp(&b.mtime()),
+            Self::SizeDesc => b.size().cmp(&a.size()),
+            Self::Name => cmp_ci(a.name(), b.name()),
+            Self::Type => {
+                // Links and other kinds form distinct extension-group sections.
+                let category = |k| if k == KIND_DIR { 0 } else { k + 1 };
+                category(a.kind()).cmp(&category(b.kind()))
+                    .then_with(|| if a.kind() == KIND_DIR { Ordering::Equal } else { cmp_ci(extension(a.name()), extension(b.name())) })
+                    .then_with(|| cmp_ci(a.name(), b.name()))
+            }
+            Self::Relevance => unreachable!("relevance compares packed score keys"),
+        };
+        if !primary.is_eq() {
+            return primary;
+        }
+        if matches!(self, Self::Name | Self::Type) {
+            let (mut ap, mut bp) = (Vec::new(), Vec::new());
+            a.path(&mut ap).cmp(b.path(&mut bp)).then_with(|| a.identity_cmp(b))
+        } else {
+            a.identity_cmp(b)
+        }
+    }
 }
 
 /// Below this many entries carrying a matching name, a query visits just
@@ -1094,9 +1204,6 @@ const BIN0: i32 = 256;
 const FIRST_BATCH: usize = 64;
 const LAST_BATCH: usize = 4096;
 const INLINE_NAMES: usize = 512;
-/// Overlay candidates a thread scores at a time (all of them on the calling
-/// thread if no more).
-const OVERLAY_CHUNK: usize = 256;
 
 pub struct Searcher<'a> {
     pub live: &'a Live,
@@ -1113,11 +1220,27 @@ impl Searcher<'_> {
     }
 
     pub fn search(&self, q: &Query) -> Vec<Hit> {
+        if q.limit == 0 {
+            return Vec::new();
+        }
         let mut hits = self.search_base(q);
         hits.extend(self.search_overlay(q));
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.idx.cmp(&b.idx)));
+        hits.sort_by(|a, b| {
+            if q.sort == Sort::Relevance {
+                b.score.cmp(&a.score).then(a.idx.cmp(&b.idx)).then_with(|| a.over.cmp(&b.over))
+            } else {
+                q.sort.compare(self.entry(a), self.entry(b))
+            }
+        });
         hits.truncate(q.limit);
         hits
+    }
+
+    fn entry<'a>(&'a self, hit: &'a Hit) -> Entry<'a> {
+        match &hit.over {
+            Some(path) => Entry::Overlay(path, &self.live.over[path]),
+            None => Entry::Base(&self.live.base, hit.idx as usize),
+        }
     }
 
     fn search_base(&self, q: &Query) -> Vec<Hit> {
@@ -1161,14 +1284,14 @@ impl Searcher<'_> {
     fn rankable<'q>(&self, q: &'q Query, lo: usize, hi: usize) -> Option<(&'q Token, bool)> {
         let mut pos = q.tokens.iter().filter(|t| !t.negate);
         let (Some(t), None) = (pos.next(), pos.next()) else { return None };
-        if t.mode != Mode::Fuzzy || q.kind.is_some() || q.size != (0, u64::MAX) || q.mtime != (0, u32::MAX) || q.path_re.is_some() || q.limit == 0 {
+        if q.sort != Sort::Relevance || t.mode != Mode::Fuzzy || q.kind.is_some() || q.size != (0, u64::MAX) || q.mtime != (0, u32::MAX) || q.path_re.is_some() || q.limit == 0 {
             return None;
         }
         // Typing on from a table (the last query was narrow): narrowing it
         // is cheaper.
         let scope = (q.scope.is_some() && hi - lo <= self.live.base.u / 4).then_some((lo, hi));
         let key = NameKey::of(q, scope);
-        if self.live.names_cache.last.lock().unwrap().as_ref().is_some_and(|p| key.narrows(&p.key)) {
+        if self.live.names_cache.last.lock().as_ref().is_some_and(|p| key.narrows(&p.key)) {
             return None;
         }
         let (idx, u) = (&self.live.base, self.live.base.u as f64);
@@ -1274,7 +1397,7 @@ impl Searcher<'_> {
         // as work.
         let visit = |names: &[Cand], floor: u64| {
             let visits = names.iter().map(|x| entries(x.k).len().min(q.limit)).sum();
-            top_k(names.len(), q.limit, visits, floor, |r, top| {
+            top_k(names.len(), q.limit, visits, floor, |a, b| b.cmp(&a), |r, top| {
                 let (mut pbuf, mut cache) = (Vec::new(), HashMap::default());
                 for c in &names[r] {
                     let nh = NameHit { score: c.score, bits: 1, flags: c.flags, best: [0; 4] };
@@ -1626,7 +1749,7 @@ impl Searcher<'_> {
                 need_dirs: true,
                 now: now_secs(),
             };
-            return Ok(top_k(ents.len(), q.limit, ents.len(), 0, |r, top| {
+            return Ok(top_k(ents.len(), q.limit, ents.len(), 0, |a, b| scan.compare_keys(a, b), |r, top| {
                 let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
                 let mut hits = HashMap::<u32, Option<NameHit>, crate::index::Fx>::default();
                 let re = q.name_re.clone();
@@ -1658,7 +1781,7 @@ impl Searcher<'_> {
         }
         let names = self.score_names(q, pos, neg, None, Some(&NameSet { busy: true, ..NameSet::new(bits) }));
         let scan = Scan { q, live: self.live, names: &names, npos: pos.len(), need_dirs: true, now: now_secs() };
-        Ok(top_k(ents.len(), q.limit, ents.len(), 0, |r, top| {
+        Ok(top_k(ents.len(), q.limit, ents.len(), 0, |a, b| scan.compare_keys(a, b), |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
             let path_re = q.path_re.clone();
             for j in r {
@@ -1679,7 +1802,7 @@ impl Searcher<'_> {
         // A small `in:` scope scores just the names found in it.
         let scope = (q.scope.is_some() && hi - lo <= self.live.base.u / 4).then_some((lo, hi));
         let key = NameKey::of(q, scope);
-        let prev = self.live.names_cache.last.lock().unwrap().clone();
+        let prev = self.live.names_cache.last.lock().clone();
         if let Some(p) = &prev
             && p.key == key
         {
@@ -1693,7 +1816,7 @@ impl Searcher<'_> {
             names: self.score_names(q, pos, neg, from, within.as_deref()),
             memo: std::sync::OnceLock::new(),
         });
-        *self.live.names_cache.last.lock().unwrap() = Some(scored.clone());
+        *self.live.names_cache.last.lock() = Some(scored.clone());
         scored
     }
 
@@ -1701,7 +1824,7 @@ impl Searcher<'_> {
     /// the folder and its ancestors, whose names folder tokens match. The
     /// last one is kept: searches in a folder tend to come in a row.
     fn scope_names(&self, lo: usize, hi: usize) -> std::sync::Arc<NameSet> {
-        let mut cache = self.live.names_cache.scope.lock().unwrap();
+        let mut cache = self.live.names_cache.scope.lock();
         if let Some((r, set)) = &*cache
             && *r == (lo, hi)
         {
@@ -1875,12 +1998,12 @@ impl Searcher<'_> {
         };
         // A spare pair from the last table (its bits cleared; ranks are only
         // read where a bit is set), or fresh ones.
-        let spare_bits = BITS_POOL.lock().unwrap().pop().filter(|(b, _)| b.len() == idx.words);
+        let spare_bits = BITS_POOL.lock().pop().filter(|(b, _)| b.len() == idx.words);
         let (mut bits, mut rank) = spare_bits.unwrap_or_else(|| (vec![0; idx.words], vec![0; idx.words]));
         // A few thousand words to look at (a small index, a scope, a
         // narrowed table) take less time than waking threads.
         let few = from.map_or(within.map_or(idx.words, |s| if s.busy { s.names } else { s.words }), |f| f.len) <= INLINE_WORDS;
-        let mut spare = std::mem::take(&mut *HIT_POOL.lock().unwrap());
+        let mut spare = std::mem::take(&mut *HIT_POOL.lock());
         spare.resize_with(idx.words.div_ceil(CHUNK_WORDS), Vec::new);
         let scratch = || vec![Line([(0, 0, 0); 2]); toks.len()];
         let chunks = bits.chunks_mut(CHUNK_WORDS).zip(rank.chunks_mut(CHUNK_WORDS)).zip(spare);
@@ -1900,9 +2023,7 @@ impl Searcher<'_> {
         NameTable::new(bits, rank, hits, ok_entries, false)
     }
 
-    /// The overlay (entries added since the last compaction) has no dir
-    /// memo: each candidate's path components stand in for it. Its top
-    /// `limit` is all the merge can use.
+    /// Each overlay piece retains only its top `limit`, in the requested order.
     fn search_overlay(&self, q: &Query) -> Vec<Hit> {
         let now = now_secs();
         let pos: Vec<&Token> = q.tokens.iter().filter(|t| !t.negate).collect();
@@ -1918,26 +2039,28 @@ impl Searcher<'_> {
         if cands.is_empty() {
             return Vec::new();
         }
+        let cmp = |a: u64, b: u64| {
+            let (ap, ao) = cands[!(a as u32) as usize];
+            let (bp, bo) = cands[!(b as u32) as usize];
+            if q.sort == Sort::Relevance {
+                return (b >> 32).cmp(&(a >> 32)).then_with(|| ap.cmp(bp));
+            }
+            q.sort.compare(Entry::Overlay(ap, ao), Entry::Overlay(bp, bo))
+        };
         // Overlay entries cluster in a few busy folders: match each folder's
         // components once per folder, not per entry.
-        let score = |items: &[&(Vec<u8>, crate::live::OEnt)]| {
+        top_k(cands.len(), q.limit, cands.len(), 0, cmp, |r, top| {
             let mut memo = HashMap::<&[u8], DirMatch, crate::index::Fx>::default();
-            let mut out = Vec::new();
-            for &&(ref path, o) in items {
+            for i in r {
+                let (path, o) = cands[i];
                 let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
                 let dir = &path[..cut];
                 if let Some(score) = q.match_path_with(path, o.kind, o.size, o.mtime, |_| *memo.entry(dir).or_insert_with(|| q.dir_match(dir))) {
                     let score = score + o.prior as i32 + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
-                    out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
+                    top.push(key(score, i as u32));
                 }
             }
-            out
-        };
-        let mut hits = if cands.len() <= OVERLAY_CHUNK { score(&cands) } else { cands.par_chunks(OVERLAY_CHUNK).flat_map_iter(score).collect() };
-        // Best first, equal scores by path (the overlay map's order).
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.over.cmp(&b.over)));
-        hits.truncate(q.limit);
-        hits
+        }).into_iter().map(|h| Hit { score: h.score, idx: u32::MAX, over: Some(cands[h.idx as usize].0.clone()) }).collect()
     }
 
     /// For each dir: which tokens its name or an ancestor's matches, with the
@@ -1947,7 +2070,7 @@ impl Searcher<'_> {
         let de = idx.dir_entry();
         let en = idx.ent_name();
         // Each dir's own name, written in parallel into a spare buffer.
-        let mut out = MEMO_POOL.lock().unwrap().pop().unwrap_or_default();
+        let mut out = MEMO_POOL.lock().pop().unwrap_or_default();
         (0..idx.d)
             .into_par_iter()
             .with_min_len(1 << 12)
@@ -1998,6 +2121,18 @@ struct Scan<'a> {
 }
 
 impl Scan<'_> {
+    #[inline]
+    fn compare_keys(&self, a: u64, b: u64) -> Ordering {
+        if self.q.sort == Sort::Relevance {
+            b.cmp(&a)
+        } else {
+            self.q.sort.compare(
+                Entry::Base(&self.live.base, !(a as u32) as usize),
+                Entry::Base(&self.live.base, !(b as u32) as usize),
+            )
+        }
+    }
+
     /// Score entry `i` whose name scored `nh`, given its parent's memo.
     /// `None` if it fails a filter or cannot beat `floor`.
     #[inline(always)]
@@ -2038,7 +2173,7 @@ impl Scan<'_> {
         let p = idx.parent()[i] as usize;
         score += idx.dir_prior()[p] as i32 + rank_tweaks(nh.flags, k, mtime, self.now);
         let key = key(score, i as u32);
-        if key <= floor {
+        if q.sort == Sort::Relevance && key <= floor {
             return None;
         }
         if let Some(re) = re {
@@ -2065,7 +2200,7 @@ impl Scan<'_> {
                 && z.min_mtime <= q.mtime.1
                 && q.kind.is_none_or(|k| z.kinds & (1 << k) != 0 || (q.apps && z.kinds & (1 << KIND_LINK) != 0))
         };
-        top_k(hi - lo, q.limit, hi - lo, 0, |r, top| {
+        top_k(hi - lo, q.limit, hi - lo, 0, |a, b| self.compare_keys(a, b), |r, top| {
             let (mut pbuf, re) = (Vec::new(), q.path_re.clone());
             let (mut a, b) = (lo + r.start, lo + r.end);
             while a < b {
@@ -2096,7 +2231,7 @@ impl Scan<'_> {
         let idx = &self.live.base;
         let (ne_off, ne, parent) = (idx.name_ents_off(), idx.name_ents(), idx.parent());
         let ok: Vec<(u32, NameHit)> = self.names.iter().filter(|(_, h)| h.flags & NF_OK != 0).collect();
-        top_k(ok.len(), self.q.limit, self.names.ok_entries, 0, |r, top| {
+        top_k(ok.len(), self.q.limit, self.names.ok_entries, 0, |a, b| self.compare_keys(a, b), |r, top| {
             let (mut pbuf, mut memo) = (Vec::new(), HashMap::<u32, DirMemo, crate::index::Fx>::default());
             let re = self.q.path_re.clone();
             for &(id, nh) in &ok[r] {
@@ -2139,7 +2274,7 @@ impl Scan<'_> {
 }
 
 /// The dir memo is ~13 MB; reusing it saves a page-fault storm per query.
-static MEMO_POOL: std::sync::Mutex<Vec<Vec<DirMemo>>> = std::sync::Mutex::new(Vec::new());
+static MEMO_POOL: parking_lot::Mutex<Vec<Vec<DirMemo>>> = parking_lot::Mutex::new(Vec::new());
 
 /// What the name table depends on: two queries with the same key score
 /// every name the same.
@@ -2196,7 +2331,7 @@ pub struct Scored {
 impl Drop for Scored {
     fn drop(&mut self) {
         if let Some(v) = self.memo.take() {
-            let mut pool = MEMO_POOL.lock().unwrap();
+            let mut pool = MEMO_POOL.lock();
             if pool.is_empty() {
                 pool.push(v);
             }
@@ -2207,21 +2342,21 @@ impl Drop for Scored {
 /// Lives with the index it was scored against (`Live`).
 #[derive(Default)]
 pub struct NameCache {
-    last: std::sync::Mutex<Option<std::sync::Arc<Scored>>>,
+    last: parking_lot::Mutex<Option<std::sync::Arc<Scored>>>,
     /// The last `in:` scope's names (see `Searcher::scope_names`).
     #[allow(clippy::type_complexity)]
-    scope: std::sync::Mutex<Option<((usize, usize), std::sync::Arc<NameSet>)>>,
+    scope: parking_lot::Mutex<Option<((usize, usize), std::sync::Arc<NameSet>)>>,
 }
 
 impl NameCache {
     /// Drop the cached table and spare buffers once searching has stopped:
     /// tens of MB after a broad query, worth keeping only while typing.
     pub fn trim_if_idle(&self, idle: std::time::Duration) {
-        let mut g = self.last.lock().unwrap();
+        let mut g = self.last.lock();
         if g.as_ref().is_some_and(|s| s.at.elapsed() > idle) {
             *g = None;
             drop(g);
-            *self.scope.lock().unwrap() = None;
+            *self.scope.lock() = None;
             trim_pools();
         }
     }
@@ -2260,23 +2395,23 @@ impl DirMemo {
 
 /// Spare hit buffers, one per name table chunk (tens of MB after a broad
 /// query), so the next broad query doesn't page-fault fresh ones in.
-static HIT_POOL: std::sync::Mutex<Vec<Vec<NameHit>>> = std::sync::Mutex::new(Vec::new());
+static HIT_POOL: parking_lot::Mutex<Vec<Vec<NameHit>>> = parking_lot::Mutex::new(Vec::new());
 
 /// Free the spare buffers searches keep for speed (after a quiet spell).
 pub fn trim_pools() {
-    BITS_POOL.lock().unwrap().clear();
-    HIT_POOL.lock().unwrap().clear();
-    DENSE_POOL.lock().unwrap().clear();
-    MEMO_POOL.lock().unwrap().clear();
+    BITS_POOL.lock().clear();
+    HIT_POOL.lock().clear();
+    DENSE_POOL.lock().clear();
+    MEMO_POOL.lock().clear();
 }
 
 /// A spare name table bitset and rank (344 KB on this disk): allocating
 /// and freeing them each search cost page faults and madvise.
 #[allow(clippy::type_complexity)]
-static BITS_POOL: std::sync::Mutex<Vec<(Vec<u64>, Vec<u16>)>> = std::sync::Mutex::new(Vec::new());
+static BITS_POOL: parking_lot::Mutex<Vec<(Vec<u64>, Vec<u16>)>> = parking_lot::Mutex::new(Vec::new());
 
 /// Spare `NameTable::dense` views (8.9 MB on this disk).
-static DENSE_POOL: std::sync::Mutex<Vec<Vec<Short>>> = std::sync::Mutex::new(Vec::new());
+static DENSE_POOL: parking_lot::Mutex<Vec<Vec<Short>>> = parking_lot::Mutex::new(Vec::new());
 
 impl Drop for NameTable {
     fn drop(&mut self) {
@@ -2287,18 +2422,18 @@ impl Drop for NameTable {
                     chunk.fill(0);
                 }
             }
-            let mut pool = BITS_POOL.lock().unwrap();
+            let mut pool = BITS_POOL.lock();
             if pool.is_empty() {
                 pool.push((std::mem::take(&mut self.bits), std::mem::take(&mut self.rank)));
             }
         }
         if let Some(d) = self.dense.take() {
-            let mut pool = DENSE_POOL.lock().unwrap();
+            let mut pool = DENSE_POOL.lock();
             if pool.is_empty() {
                 pool.push(d);
             }
         }
-        let mut pool = HIT_POOL.lock().unwrap();
+        let mut pool = HIT_POOL.lock();
         if pool.is_empty() {
             *pool = std::mem::take(&mut self.hits);
             pool.iter_mut().for_each(Vec::clear);
@@ -2357,7 +2492,7 @@ impl NameTable {
     /// The `dense` view, built on first use.
     fn dense(&self, idx: &Index) -> &[Short] {
         self.dense.get_or_init(|| {
-            let spare = DENSE_POOL.lock().unwrap().pop().filter(|d| d.len() == idx.words * 64);
+            let spare = DENSE_POOL.lock().pop().filter(|d| d.len() == idx.words * 64);
             // A fresh one comes zeroed (all `Short::default()`) from the
             // allocator, which maps zero pages in without writing them.
             let fresh = spare.is_none();
@@ -2509,4 +2644,127 @@ fn rank_tweaks(flags: u8, kind: u8, mtime: u32, now: u32) -> i32 {
         _ => 0,
     };
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::Index;
+    use crate::walk::{Listing, RawEnt, NONE};
+
+    #[test]
+    fn global_sorts_keep_metadata_winners_and_merge_overlay() {
+        let listing = |id, rows: &[(&str, u8, u64, u32, u32)]| {
+            let mut out = Listing { id, names: Vec::new(), ents: Vec::new() };
+            for &(name, kind, size, mtime, child) in rows {
+                out.ents.push(RawEnt { name_off: out.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child });
+                out.names.extend_from_slice(name.as_bytes());
+            }
+            out
+        };
+        let base = Index::build(vec![
+            listing(0, &[
+                ("m.rs", KIND_FILE, 10, 10, NONE),
+                ("zzm.TXT", KIND_FILE, 70, 30, NONE),
+                ("Alpha.txt", KIND_FILE, 50, 20, NONE),
+                ("beta.RS", KIND_FILE, 40, 5, NONE),
+                ("Folder", KIND_DIR, 0, 0, 1),
+            ]),
+            listing(1, &[("Alpha.txt", KIND_FILE, 50, 20, NONE)]),
+        ], 0, 0, b"/home/test");
+        let mut live = Live::new(base);
+        let paths = |live: &Live, text: &str| {
+            let q = Query::parse(text, "/home/test").unwrap();
+            Searcher { live }.search(&q).iter().map(|h| {
+                let mut buf = Vec::new();
+                Searcher { live }.entry(h).path(&mut buf).to_vec()
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&live, "m limit:1"), [b"/m.rs".to_vec()]);
+        assert_eq!(paths(&live, "m sort:modified-desc limit:1"), [b"/zzm.TXT".to_vec()]);
+        // Exercise the full scan directly as well as search's selective scan.
+        let q = Query::parse("m sort:modified-desc limit:1", "/home/test").unwrap();
+        let s = Searcher { live: &live };
+        let pos = q.tokens.iter().collect::<Vec<_>>();
+        let scored = s.names(&q, &pos, &[], 1, live.base.n);
+        let scan = Scan { q: &q, live: &live, names: &scored.names, npos: 1, need_dirs: false, now: now_secs() };
+        let full = scan.full(1, live.base.n, None);
+        assert_eq!(live.base.name(full[0].idx as usize), b"zzm.TXT");
+        drop(scored);
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(format!(".fsearch-query-test-{}-{}", std::process::id(), now_secs()));
+        std::fs::create_dir(&root).unwrap();
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _scratch = Scratch(root.clone());
+        let root = std::fs::canonicalize(root).unwrap();
+        for (name, size, mtime) in [("overlay-m.rs", 100, 40), ("aardvark.TXT", 60, 25)] {
+            let f = std::fs::File::create(root.join(name)).unwrap();
+            f.set_len(size).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime))).unwrap();
+        }
+        std::os::unix::fs::symlink("overlay-m.rs", root.join("link.rs")).unwrap();
+        live.apply_dir(root.as_os_str().as_bytes(), false);
+        let overlay = root.join("overlay-m.rs").as_os_str().as_bytes().to_vec();
+        let aardvark = root.join("aardvark.TXT").as_os_str().as_bytes().to_vec();
+        let link = root.join("link.rs").as_os_str().as_bytes().to_vec();
+        assert_eq!(paths(&live, "m sort:modified-desc limit:1"), [overlay.clone()]);
+        assert_eq!(paths(&live, "m sort:modified-asc limit:1"), [b"/m.rs".to_vec()]);
+        assert_eq!(paths(&live, "sort:size-desc limit:2"), [overlay.clone(), b"/zzm.TXT".to_vec()]);
+        assert_eq!(paths(&live, "sort:name limit:3"), [
+            aardvark.clone(), b"/Alpha.txt".to_vec(), b"/Folder/Alpha.txt".to_vec(),
+        ]);
+        assert_eq!(paths(&live, "sort:type limit:20"), [
+            b"/Folder".to_vec(), b"/beta.RS".to_vec(), b"/m.rs".to_vec(), overlay.clone(),
+            aardvark, b"/Alpha.txt".to_vec(), b"/Folder/Alpha.txt".to_vec(), b"/zzm.TXT".to_vec(), link,
+        ]);
+        assert!(paths(&live, "sort:modified-desc limit:0").is_empty());
+        assert!(Query::parse("sort:unknown", "/home/test").is_err());
+        let mut api = Query::parse("m limit:1", "/home/test").unwrap();
+        assert!(api.filter("sort", "modified-desc", "/home/test").unwrap());
+        assert_eq!(Searcher { live: &live }.search(&api)[0].over.as_deref(), Some(overlay.as_slice()));
+        assert!(api.filter("sort", "unknown", "/home/test").is_err());
+    }
+
+    #[test]
+    fn metadata_sorts_do_not_use_relevance_floors() {
+        let mut listing = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+        for (name, size, mtime) in (0..128).map(|i| (format!("m{i:03}.rs"), 10, 20))
+            .chain([("zzm.TXT".to_string(), 100, 30), ("zzoldm.rs".to_string(), 200, 1)])
+        {
+            listing.ents.push(RawEnt {
+                name_off: listing.names.len() as u32, name_len: name.len() as u16,
+                kind: KIND_FILE, size, mtime, child: NONE,
+            });
+            listing.names.extend_from_slice(name.as_bytes());
+        }
+        let live = Live::new(Index::build(vec![listing], 0, 0, b"/home/test"));
+        let searcher = Searcher { live: &live };
+        for (sort, winner) in [
+            ("modified-desc", b"zzm.TXT".as_slice()),
+            ("modified-asc", b"zzoldm.rs".as_slice()),
+            ("size-desc", b"zzoldm.rs".as_slice()),
+            ("name", b"m000.rs".as_slice()),
+            ("type", b"m000.rs".as_slice()),
+        ] {
+            // More than a top-k buffer's worth of matches: a sort floor is
+            // established before lower-relevance metadata winners are seen.
+            for tokens in ["m", "m !absent"] {
+                let q = Query::parse(&format!("{tokens} sort:{sort} limit:1"), "/home/test").unwrap();
+                assert!(searcher.rankable(&q, 1, live.base.n).is_none());
+                let hits = searcher.search(&q);
+                assert_eq!(hits.len(), 1);
+                assert_eq!(live.base.name(hits[0].idx as usize), winner);
+                let pos = q.tokens.iter().filter(|t| !t.negate).collect::<Vec<_>>();
+                let neg = q.tokens.iter().filter(|t| t.negate).collect::<Vec<_>>();
+                let scored = searcher.names(&q, &pos, &neg, 1, live.base.n);
+                let scan = Scan { q: &q, live: &live, names: &scored.names, npos: pos.len(), need_dirs: !neg.is_empty(), now: now_secs() };
+                let memo = scan.need_dirs.then(|| searcher.dir_tokens(&scored.names));
+                let full = scan.full(1, live.base.n, memo.as_deref());
+                assert_eq!(full.len(), 1);
+                assert_eq!(live.base.name(full[0].idx as usize), winner);
+            }
+        }
+    }
 }

@@ -210,8 +210,9 @@ fn run(snap: &Path, corpus: &str, out: &str, kinds: &str) {
     let content = Content::open_shared(snap.join("content"));
     let load = ms(t.elapsed());
     let pool = rayon::ThreadPoolBuilder::new()
-        .start_handler(|_| unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        .start_handler(|_| {
+            #[cfg(target_os = "macos")]
+            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
         })
         .build()
         .unwrap();

@@ -34,7 +34,8 @@ pub const MAX_FILE: u64 = 1 << 20;
 const SEG_BYTES: u64 = 64 << 20;
 /// Largest merge, in posting bytes; bounds the merge's transient memory.
 const MERGE_CAP: usize = 96 << 20;
-const MAGIC: &[u8; 8] = b"FSCSEG10";
+// Upstream's content tables plus per-doc nanosecond change tracking.
+const MAGIC: &[u8; 8] = b"FSCSEG11";
 /// tri_off high bit: this trigram's list is a bitset over the segment's
 /// contents (cheaper than varints once more than 1 in 8 contain it).
 const BITSET: u32 = 1 << 31;
@@ -133,13 +134,14 @@ enum S {
     Bloom,
     LongOff,
     Long,
+    ChangeNs,
 }
-const NS: usize = 22;
+const NS: usize = 23;
 
 #[rustfmt::skip]
 fn lens(ndocs: usize, ntri: usize, plen: usize, paths_len: usize, nwords: usize, nown: usize, nlong: usize) -> [usize; NS] {
     let (d, c) = (ndocs * 4, nown * 4);
-    [ntri * 4, (ntri + 1) * 4, plen, d + 4, paths_len, ndocs * 8, d, d, ndocs, d, d, d, d, d, c, c, c * 4, c, c + 4, nwords * 8, c + 4, nlong * 8]
+    [ntri * 4, (ntri + 1) * 4, plen, d + 4, paths_len, ndocs * 8, d, d, ndocs, d, d, d, d, d, c, c, c * 4, c, c + 4, nwords * 8, c + 4, nlong * 8, ndocs * 8]
 }
 
 impl Segment {
@@ -171,6 +173,7 @@ impl Segment {
     sec!(bloom, S::Bloom, u64, nwords);
     sec!(long_off, S::LongOff, u32, nown1);
     sec!(long, S::Long, u64, nlong);
+    sec!(change_ns, S::ChangeNs, u64, ndocs);
 
     pub fn path(&self, d: u32) -> &[u8] {
         let o = self.path_off();
@@ -538,7 +541,7 @@ fn symbols(buf: &[u8], out: &mut Vec<u32>) {
 #[derive(Default)]
 pub struct Docs {
     buf: Vec<u8>,
-    items: Vec<(u32, u32, u64, u32)>,
+    items: Vec<(u32, u32, u64, u32, u64)>,
     /// What builds of these docs share: the contents already indexed (set
     /// by `diff`; docs from elsewhere are for a new, empty index).
     dedup: std::sync::OnceLock<Dedup>,
@@ -550,8 +553,8 @@ pub struct Docs {
 #[derive(Default)]
 struct Dedup {
     held: Vec<Held>,
-    built: std::sync::Mutex<HashMap<[u64; 2], u32>>,
-    free: std::sync::Mutex<Gids>,
+    built: parking_lot::Mutex<HashMap<[u64; 2], u32>>,
+    free: parking_lot::Mutex<Gids>,
 }
 
 /// A segment's own contents, findable by hash while a sync builds.
@@ -580,7 +583,7 @@ impl Held {
 impl Dedup {
     /// The gid of a content with this hash, if one is indexed.
     fn find(&self, h: [u64; 2]) -> Option<u32> {
-        self.held.iter().find_map(|s| s.find(h)).or_else(|| self.built.lock().unwrap().get(&h).copied())
+        self.held.iter().find_map(|s| s.find(h)).or_else(|| self.built.lock().get(&h).copied())
     }
 }
 
@@ -615,12 +618,20 @@ impl Gids {
 }
 
 impl Docs {
-    fn push(&mut self, path: &[u8], size: u64, mtime: u32) {
-        self.items.push((self.buf.len() as u32, path.len() as u32, size, mtime));
+    fn push(&mut self, path: &[u8], size: u64, mtime: u32, change_ns: u64) {
+        self.items.push((self.buf.len() as u32, path.len() as u32, size, mtime, change_ns));
         self.buf.extend_from_slice(path);
     }
+    fn push_current(&mut self, path: &[u8]) {
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        let Ok(meta) = std::fs::symlink_metadata(std::ffi::OsStr::from_bytes(path)) else { return };
+        if !meta.is_file() || meta.len() > MAX_FILE { return; }
+        // ctime catches equal-size writes even if mtime is restored.
+        let change_ns = (meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128).clamp(0, u64::MAX as i128) as u64;
+        self.push(path, meta.len(), meta.mtime().clamp(0, u32::MAX as i64) as u32, change_ns);
+    }
     fn path(&self, i: usize) -> &[u8] {
-        let (o, l, _, _) = self.items[i];
+        let (o, l, _, _, _) = self.items[i];
         &self.buf[o as usize..(o + l) as usize]
     }
     pub fn len(&self) -> usize {
@@ -635,7 +646,7 @@ impl Docs {
         self.items.dedup_by(|a, b| buf[a.0 as usize..(a.0 + a.1) as usize] == buf[b.0 as usize..(b.0 + b.1) as usize]);
     }
     fn find(&self, path: &[u8]) -> Option<usize> {
-        let i = self.items.partition_point(|&(o, l, _, _)| &self.buf[o as usize..(o + l) as usize] < path);
+        let i = self.items.partition_point(|&(o, l, _, _, _)| &self.buf[o as usize..(o + l) as usize] < path);
         (i < self.items.len() && self.path(i) == path).then_some(i)
     }
 
@@ -668,6 +679,7 @@ struct DocMeta<'a> {
     path: &'a [u8],
     size: u64,
     mtime: u32,
+    change_ns: u64,
     rank: i8,
     gid: u32,
 }
@@ -730,13 +742,13 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
     const AHEAD: usize = 8;
     let dedup = docs.dedup.get_or_init(Dedup::default);
     // Contents new in this build, by hash, numbered as first seen.
-    let new = std::sync::Mutex::new(HashMap::<[u64; 2], u32>::new());
-    let scratch = std::sync::Mutex::new(Vec::new());
+    let new = parking_lot::Mutex::new(HashMap::<[u64; 2], u32>::new());
+    let scratch = parking_lot::Mutex::new(Vec::new());
     let runs: Vec<std::ops::Range<usize>> = range.clone().step_by(RUN).map(|s| s..(s + RUN).min(range.end)).collect();
     let splits: Vec<Split> = (runs.into_par_iter())
         .map(|run| {
             let (mut seen, mut buf, mut short, mut long, mut tri) =
-                scratch.lock().unwrap().pop().unwrap_or_else(|| (vec![0u64; 3 << 18], Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+                scratch.lock().pop().unwrap_or_else(|| (vec![0u64; 3 << 18], Vec::new(), Vec::new(), Vec::new(), Vec::new()));
             #[rustfmt::skip]
             let mut sp = Split { pairs: vec![Vec::new(); 256], syms: Vec::new(), blooms: Vec::new(), longs: Vec::new(), docs: Vec::new(), contents: Vec::new() };
             let mut ahead = std::collections::VecDeque::new();
@@ -756,7 +768,7 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                         Some(g) => Holds::Gid(g),
                         None => {
                             let (k, first) = {
-                                let mut m = new.lock().unwrap();
+                                let mut m = new.lock();
                                 let n = m.len() as u32;
                                 let k = *m.entry(h).or_insert(n);
                                 (k, k == n)
@@ -781,13 +793,13 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
                 };
                 sp.docs.push((i, holds));
             }
-            scratch.lock().unwrap().push((seen, buf, short, long, tri));
+            scratch.lock().push((seen, buf, short, long, tri));
             sp
         })
         .collect();
     // The new contents, numbered by their first doc (docs in path order:
     // splits cover contiguous runs, in order), with gids.
-    let nnew = new.into_inner().unwrap().len();
+    let nnew = new.into_inner().len();
     let (mut local, mut first) = (vec![NONE; nnew], Vec::with_capacity(nnew));
     for (d, &(_, holds)) in splits.iter().flat_map(|sp| &sp.docs).enumerate() {
         if let Holds::New(k) = holds
@@ -797,16 +809,16 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
             first.push(d as u32);
         }
     }
-    let gids = dedup.free.lock().unwrap().take(nnew);
+    let gids = dedup.free.lock().take(nnew);
     let meta: Vec<DocMeta> = (splits.iter().flat_map(|sp| &sp.docs))
         .map(|&(i, holds)| {
-            let (_, _, size, mtime) = docs.items[i];
+            let (_, _, size, mtime, change_ns) = docs.items[i];
             let gid = match holds {
                 Holds::Nothing => NONE,
                 Holds::Gid(g) => g,
                 Holds::New(k) => gids[local[k as usize] as usize],
             };
-            DocMeta { path: docs.path(i), size, mtime, rank: if gid == NONE { NOT_TEXT } else { doc_rank(docs.path(i)) }, gid }
+            DocMeta { path: docs.path(i), size, mtime, change_ns, rank: if gid == NONE { NOT_TEXT } else { doc_rank(docs.path(i)) }, gid }
         })
         .collect();
     let mut own: Vec<Option<ContentMeta>> = (0..nnew).map(|_| None).collect();
@@ -849,7 +861,7 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
         .collect();
     let seg = write_segment(dir, id, &meta, &own, parts)?;
     // This sync's later builds find these contents.
-    dedup.built.lock().unwrap().extend(shared);
+    dedup.built.lock().extend(shared);
     Some(seg)
 }
 
@@ -861,7 +873,7 @@ pub fn merge(dir: &Path, id: u64, segs: &[&Segment]) -> Option<Segment> {
     for s in segs {
         for d in (0..s.ndocs as u32).filter(|&d| !s.is_dead(d)) {
             let i = d as usize;
-            meta.push(DocMeta { path: s.path(d), size: s.size()[i], mtime: s.mtime()[i], rank: s.rank()[i], gid: s.doc_gid()[i] });
+            meta.push(DocMeta { path: s.path(d), size: s.size()[i], mtime: s.mtime()[i], change_ns: s.change_ns()[i], rank: s.rank()[i], gid: s.doc_gid()[i] });
         }
     }
     let (mut own, mut remap) = (Vec::new(), Vec::with_capacity(segs.len()));
@@ -984,6 +996,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
     let size: Vec<u64> = docs.iter().map(|d| d.size).collect();
     let mtime: Vec<u32> = docs.iter().map(|d| d.mtime).collect();
     let rank: Vec<i8> = docs.iter().map(|d| d.rank).collect();
+    let change_ns: Vec<u64> = docs.iter().map(|d| d.change_ns).collect();
     let mut by_path: Vec<u32> = (0..ndocs as u32).collect();
     by_path.sort_by(|&a, &b| docs[a as usize].path.cmp(docs[b as usize].path));
     let mut by_rank: Vec<u32> = (0..ndocs as u32).collect();
@@ -1032,6 +1045,7 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], own: &[ContentMeta<'
         as_bytes(&blooms),
         as_bytes(&long_off),
         as_bytes(&longs),
+        as_bytes(&change_ns),
     ];
     let p = seg_path(dir, id);
     let tmp = p.with_extension("tmp");
@@ -1388,7 +1402,10 @@ impl Content {
                     match want.find(s.path(d)) {
                         // (A doc whose content is gone is indexed again.)
                         Some(k)
-                            if want.items[k].2 == s.size()[i] && want.items[k].3 == s.mtime()[i] && (g == NONE || content_of(gids, g).is_some()) =>
+                            if want.items[k].2 == s.size()[i]
+                                && want.items[k].3 == s.mtime()[i]
+                                && want.items[k].4 == s.change_ns()[i]
+                                && (g == NONE || content_of(gids, g).is_some()) =>
                         {
                             held[k] = true
                         }
@@ -1403,8 +1420,8 @@ impl Content {
             }
             for (i, h) in held.iter().enumerate() {
                 if !h {
-                    let (_, _, size, mtime) = want.items[i];
-                    todo.push(want.path(i), size, mtime);
+                    let (_, _, size, mtime, change_ns) = want.items[i];
+                    todo.push(want.path(i), size, mtime, change_ns);
                 }
             }
         }
@@ -1443,7 +1460,7 @@ impl Content {
             }
             next = next.max(g + n);
         }
-        Dedup { held, built: Default::default(), free: std::sync::Mutex::new(Gids { gaps, next }) }
+        Dedup { held, built: Default::default(), free: parking_lot::Mutex::new(Gids { gaps, next }) }
     }
 
     /// Folders holding an indexed file that changed (or went away) since
@@ -1655,9 +1672,9 @@ impl Content {
         let bulk: Vec<std::sync::OnceLock<(Vec<u64>, usize)>> = (0..n).map(|_| Default::default()).collect();
         let (next, done, next_item, total) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
         // Chunks to expand, and how many there are (checked before locking).
-        let chunks: std::sync::Mutex<Vec<Chunk>> = Default::default();
+        let chunks: parking_lot::Mutex<Vec<Chunk>> = Default::default();
         let queued = AtomicUsize::new(0);
-        let out = std::sync::Mutex::new(Vec::new());
+        let out = parking_lot::Mutex::new(Vec::new());
         // (Each lane gathers the docs it finds in its own `Top`.)
         let expand = |a: usize, sel: &[u32], top: &mut Top| {
             let at = top.len();
@@ -1689,7 +1706,7 @@ impl Content {
                 return expand(a, &sel, top);
             }
             let sel = std::sync::Arc::new(sel);
-            let mut q = chunks.lock().unwrap();
+            let mut q = chunks.lock();
             q.extend((step..sel.len()).step_by(step).map(|at| (a, sel.clone(), at..(at + step).min(sel.len()))));
             queued.store(q.len(), Release);
             drop(q);
@@ -1773,7 +1790,7 @@ impl Content {
                     }
                     i += 1;
                 }
-                return out.lock().unwrap().push(Cands::Bulk { si: b, top: best, from: i });
+                return out.lock().push(Cands::Bulk { si: b, top: best, from: i });
             }
             // (The owners counted these.)
             let (gs, by_gid) = (t.gid_sorted(), t.by_gid());
@@ -1808,7 +1825,7 @@ impl Content {
                 }
                 if queued.load(Acquire) > 0 {
                     let chunk = {
-                        let mut q = chunks.lock().unwrap();
+                        let mut q = chunks.lock();
                         let c = q.pop();
                         queued.store(q.len(), Release);
                         c
@@ -1825,11 +1842,11 @@ impl Content {
             }
             if top.len() > 0 {
                 let c = top.done();
-                out.lock().unwrap().push(c);
+                out.lock().push(c);
             }
         };
         run_lanes((docs / 25_000).clamp(1, 8), &work);
-        let per = out.into_inner().unwrap();
+        let per = out.into_inner();
         let dense = dense.into_inner().map_or(Vec::new(), |d| d.into_iter().map(|w| w.into_inner()).collect());
         Found { per, total: total.into_inner(), dense }
     }
@@ -2074,7 +2091,7 @@ fn set_bits(bits: &[u64], n: usize) -> Vec<u32> {
 fn par_claim<T: Sync, R: Send>(items: &[T], lanes: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let next = AtomicUsize::new(0);
-    let out = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    let out = parking_lot::Mutex::new(Vec::with_capacity(items.len()));
     run_lanes(lanes, &|| {
         let mut mine = Vec::new();
         loop {
@@ -2082,9 +2099,9 @@ fn par_claim<T: Sync, R: Send>(items: &[T], lanes: usize, f: impl Fn(&T) -> R + 
             let Some(x) = items.get(i) else { break };
             mine.push((i, f(x)));
         }
-        out.lock().unwrap().extend(mine);
+        out.lock().extend(mine);
     });
-    let mut out = out.into_inner().unwrap();
+    let mut out = out.into_inner();
     out.sort_unstable_by_key(|r| r.0);
     out.into_iter().map(|r| r.1).collect()
 }
@@ -2119,8 +2136,8 @@ impl Lanes {
 
 /// Threads that help searches: the latest search's lanes, and a bell.
 struct Helpers {
-    latest: std::sync::Mutex<(u64, Option<std::sync::Arc<Lanes>>)>,
-    bell: std::sync::Condvar,
+    latest: parking_lot::Mutex<(u64, Option<std::sync::Arc<Lanes>>)>,
+    bell: parking_lot::Condvar,
 }
 
 fn helpers() -> &'static Helpers {
@@ -2132,14 +2149,16 @@ fn helpers() -> &'static Helpers {
             let spawned = std::thread::Builder::new().name(format!("fsearch-help-{i}")).spawn(move || {
                 // Someone is waiting: keep off the slow cores and out of the
                 // throttled IO tiers, and never download iCloud placeholders.
+                #[cfg(target_os = "macos")]
                 unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
+                #[cfg(target_os = "macos")]
                 crate::no_materialize();
                 let mut seen = 0;
                 loop {
                     let lanes = {
-                        let mut g = h.latest.lock().unwrap();
+                        let mut g = h.latest.lock();
                         while g.0 == seen {
-                            g = h.bell.wait(g).unwrap();
+                            h.bell.wait(&mut g);
                         }
                         seen = g.0;
                         g.1.clone()
@@ -2172,7 +2191,7 @@ fn run_lanes(n: usize, job: &(dyn Fn() + Sync)) {
     let job: *const (dyn Fn() + Sync + 'static) = unsafe { std::mem::transmute(job) };
     let lanes = std::sync::Arc::new(Lanes { n, next: AtomicUsize::new(0), done: AtomicUsize::new(0), panicked: AtomicBool::new(false), job });
     {
-        let mut g = h.latest.lock().unwrap();
+        let mut g = h.latest.lock();
         g.0 += 1;
         g.1 = Some(lanes.clone());
     }
@@ -2225,14 +2244,14 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
                 p = join(dir, idx.name(i));
             }
             if in_scope(&p, home) {
-                want.push(&p, idx.size_of(i), idx.mtime()[i]);
+                want.push_current(&p);
             }
         }
     }
     let lo = join(dir, b"");
     for (k, o) in live.over.range(lo.clone()..).take_while(|(k, _)| k.starts_with(&lo)) {
         if o.kind & 3 == KIND_FILE && (recursive || !k[lo.len()..].contains(&b'/')) && eligible(k, o.size, home) {
-            want.push(k, o.size, o.mtime);
+            want.push_current(k);
         }
     }
     want
@@ -2374,18 +2393,23 @@ const SCAN_READERS: usize = 8;
 /// Run `f` with this thread never downloading iCloud placeholders (as the
 /// helper threads), then restore its policy.
 fn without_materializing<T>(f: impl FnOnce() -> T) -> T {
-    unsafe extern "C" {
-        fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
-        fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn getiopolicy_np(iotype: i32, scope: i32) -> i32;
+            fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
+        }
+        // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
+        let prior = unsafe { getiopolicy_np(3, 1) };
+        crate::no_materialize();
+        let r = f();
+        if prior >= 0 {
+            unsafe { setiopolicy_np(3, 1, prior) };
+        }
+        r
     }
-    // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD
-    let prior = unsafe { getiopolicy_np(3, 1) };
-    crate::no_materialize();
-    let r = f();
-    if prior >= 0 {
-        unsafe { setiopolicy_np(3, 1, prior) };
-    }
-    r
+    #[cfg(not(target_os = "macos"))]
+    f()
 }
 
 pub struct FileMatches {
@@ -2415,7 +2439,7 @@ fn verify_from<'a>(
 ) -> (GrepResult, usize) {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     let (next, found, read) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
-    let hits = std::sync::Mutex::new(Vec::new());
+    let hits = parking_lot::Mutex::new(Vec::new());
     let work = || {
         while found.load(Relaxed) < limit && g.budget.is_none_or(|b| t.elapsed() <= b) {
             let i = next.fetch_add(1, Relaxed);
@@ -2426,7 +2450,7 @@ fn verify_from<'a>(
             read.fetch_add(1, Relaxed);
             if let Some(m) = match_file(g, p) {
                 found.fetch_add(1, Relaxed);
-                hits.lock().unwrap().push((i, m));
+                hits.lock().push((i, m));
             }
         }
         // Don't sit on a big file's worth of buffer between searches.
@@ -2437,7 +2461,7 @@ fn verify_from<'a>(
         });
     };
     without_materializing(|| run_lanes(readers, &work));
-    let mut hits = hits.into_inner().unwrap();
+    let mut hits = hits.into_inner();
     hits.sort_unstable_by_key(|h| h.0);
     hits.truncate(limit);
     let done = next.into_inner().min(n);
@@ -3146,7 +3170,22 @@ pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
 fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::ffi::CString::new(path).ok()?;
+        // access() uses the real uid, excluding the watcher's DAC capability.
+        if unsafe { libc::access(path.as_ptr(), libc::R_OK) } != 0 {
+            return None;
+        }
+    }
     let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::syscall(libc::SYS_faccessat2, f.as_raw_fd(), c"".as_ptr(), libc::R_OK, libc::AT_EMPTY_PATH) } != 0 {
+            return None;
+        }
+    }
     let m = f.metadata().ok()?;
     m.is_file().then_some((f, m.len()))
 }
@@ -3156,7 +3195,12 @@ fn open_sized(path: &[u8]) -> Option<(std::fs::File, u64)> {
 fn open_ahead(path: &[u8]) -> Option<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let (f, len) = open_sized(path)?;
-    let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_FILE + 1) as libc::c_int };
-    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+    #[cfg(target_os = "macos")]
+    {
+        let ra = libc::radvisory { ra_offset: 0, ra_count: len.min(MAX_FILE + 1) as libc::c_int };
+        unsafe { libc::fcntl(f.as_raw_fd(), libc::F_RDADVISE, &ra) };
+    }
+    #[cfg(target_os = "linux")]
+    unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, len.min(MAX_FILE + 1) as libc::off_t, libc::POSIX_FADV_WILLNEED) };
     Some(f)
 }
