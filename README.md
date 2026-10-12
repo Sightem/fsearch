@@ -2,7 +2,7 @@
 
 Whole-disk file search for Linux and macOS, with fuzzy names, typo tolerance
 and indexed content search. Use the CLI, desktop terminal picker, JSON-lines
-API, or Rust crate. Linux measurements and upstream macOS comparisons are
+API, or Rust crate. Linux measurements and upstream macOS benchmarks are
 listed separately below.
 
 ```
@@ -39,6 +39,10 @@ Data lives in `${XDG_DATA_HOME:-$HOME/.local/share}/fsearch`. Linux has no
 durable fanotify replay journal, so restarts reconcile the disk while live
 events are queued. `fsearch uninstall` removes the service and privileged
 binary but preserves the user CLI and index.
+
+Closing and reopening the picker reuses the running daemon without a crawl.
+Restarting the Linux daemon itself requires reconciliation; it cannot replay
+changes made while it was stopped. macOS retains native FSEvents replay.
 
 The rebased content cache uses `FSCSEG11`; older caches are rebuilt
 automatically without changing source files. Filename notifications are
@@ -184,7 +188,8 @@ follow.
   fanotify and reconciles after restarts or event loss.
 - Names live in one mmap'd file, laid out folder by folder so `in:` is a
   range. A bitmap of each distinct name's letters prunes scoring.
-- Content search deduplicates identical files and uses trigram postings plus
-  per-content gram filters to avoid unrelated reads. Matches are read fresh
-  from disk; nanosecond inode change timestamps detect equal-size edits even
-  when modification timestamps are restored.
+- Content search uses trigram postings and per-content gram filters to avoid
+  unrelated reads. Identical contents are shared across segments; contents
+  smaller than 256 bytes are shared only within a segment. Matches are read
+  fresh from disk; nanosecond inode change timestamps detect equal-size edits
+  even when modification timestamps are restored.
